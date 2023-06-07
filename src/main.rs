@@ -5,61 +5,35 @@ use rand::rngs::ThreadRng;
 use rand::Rng;
 
 const ASPECT_RATIO: f32 = 16.0 / 9.0;
-const WIDTH: u32 = 1000;
+const WIDTH: u32 = 400;
 const HEIGHT: u32 = (WIDTH as f32 / ASPECT_RATIO) as u32;
 
-const SAMPLES_PER_PIXEL: u32 = 100;
-const MAX_DEPTH: i32 = 50;
+const SAMPLES_PER_PIXEL: u32 = 40;
+const MAX_DEPTH: i32 = 10;
 
 fn main() {
     println!("Begin render {}x{}", WIDTH, HEIGHT);
 
     // Image
     let mut image_buffer = ImageBuffer::new(WIDTH, HEIGHT);
-    // Camera
-    let camera: Camera = Camera::new();
-    let mut rng = rand::thread_rng();
 
     // World
-    let mut hittable_list: HittableList = HittableList {
+    let hittable_list: HittableList = HittableList {
         objects: Vec::from([
             Box::new(Sphere {
-                center: Vec3::new(-1.0, 0.0, -1.0),
+                center: Vec3::new(0.0, 0.0, -1.0),
                 radius: 0.5,
-                metal: true,
-            }) as Box<_>,
-            Box::new(Sphere {
-                center: Vec3::new(0.0, 0.0, -2.0),
-                radius: 0.5,
-                metal: true,
-            }) as Box<_>,
-            Box::new(Sphere {
-                center: Vec3::new(1.0, 0.0, -1.0),
-                radius: 0.5,
-                metal: true,
             }) as Box<_>,
             Box::new(Sphere {
                 center: Vec3::new(0.0, -100.5, -1.0),
                 radius: 100.0,
-                metal: false,
             }) as Box<_>,
         ]),
     };
 
-    for n in 0..100 {
-        hittable_list.objects.insert(
-            0,
-            Box::new(Sphere {
-                center: Vec3::new(
-                    rng.gen_range(0.0..60.0) - 30.0,
-                    rng.gen_range(0.0..20.0),
-                    -rng.gen_range(0.0..30.0) + 5.0,
-                ),
-                radius: rng.gen_range(0.1..0.4),
-                metal: false,
-            }) as Box<_>,
-        );
-    }
+    // Camera
+    let camera: Camera = Camera::new();
+    let mut rng = rand::thread_rng();
 
     let pixel_multiplier = Vec3::new(255.0, 255.0, 255.0);
     let samples = Vec3::new(
@@ -143,23 +117,15 @@ pub struct HitRecord {
     p: Vec3,
     normal: Vec3,
     t: f32,
-    material: Box<dyn Material + 'static>,
 }
 
 impl HitRecord {
-    pub fn new(
-        r: &Ray,
-        normal: Vec3,
-        t: f32,
-        p: Vec3,
-        material: Box<dyn Material + 'static>,
-    ) -> Self {
+    pub fn new(r: &Ray, normal: Vec3, t: f32, p: Vec3) -> Self {
         let front_face = Vec3::dot(r.dir, normal) < 0.0;
         HitRecord {
             t: t,
             p: p,
             normal: if front_face { normal } else { -normal },
-            material: material,
         }
     }
 }
@@ -171,7 +137,6 @@ pub trait Hittable {
 pub struct Sphere {
     pub center: Vec3,
     pub radius: f32,
-    pub metal: bool,
 }
 
 impl Hittable for Sphere {
@@ -197,27 +162,7 @@ impl Hittable for Sphere {
         }
 
         let p = r.at(root);
-        if (self.metal) {
-            return Some(HitRecord::new(
-                r,
-                (p - self.center) / self.radius,
-                root,
-                p,
-                Box::new(Metal {
-                    albedo: Vec3::new(0.5, 0.5, 0.5),
-                }),
-            ));
-        } else {
-            return Some(HitRecord::new(
-                r,
-                (p - self.center) / self.radius,
-                root,
-                p,
-                Box::new(Lambertian {
-                    albedo: Vec3::new(0.5, 0.5, 0.5),
-                }),
-            ));
-        }
+        return Some(HitRecord::new(r, (p - self.center) / self.radius, root, p));
     }
 }
 
@@ -258,14 +203,13 @@ impl Ray {
         if hit.is_some() {
             // Draw collision surface normal
             let rec = hit.unwrap();
-            let cc = rec.material.scatter(self, &rec, rng);
-
-            if (cc.is_some()) {
-                let ccc = cc.unwrap();
-                return ccc.1 * ccc.0.color(hittable, rng, depth - 1);
-            }
-
-            return Vec3::new(0.0, 0.0, 0.0);
+            let target = rec.p + Ray::random_in_unit_sphere(rng, rec.normal);
+            return 0.5
+                * Ray {
+                    pos: rec.p,
+                    dir: target - rec.p,
+                }
+                .color(hittable, rng, depth - 1);
         }
 
         // Background gradient
@@ -289,87 +233,21 @@ impl Ray {
         }
     }
 
-    pub fn random_in_unit_sphere(rng: &mut ThreadRng) -> Vec3 {
+    pub fn random_in_unit_sphere(rng: &mut ThreadRng, normal: Vec3) -> Vec3 {
         let die = Uniform::from(-1.0..1.0);
 
         while true {
             let p = Vec3::new(die.sample(rng), die.sample(rng), die.sample(rng));
 
             if p.length_squared() < 1.0 {
-                return p;
+                if (Vec3::dot(p, normal) > 0.0) {
+                    return p;
+                }
+
+                return -p;
             }
         }
 
         return Vec3::new(0.0, 0.0, 0.0);
-    }
-
-    pub fn random_in_hemisphere(p: Vec3, normal: Vec3) -> Vec3 {
-        if (Vec3::dot(p, normal) > 0.0) {
-            return p;
-        }
-
-        return -p;
-    }
-}
-
-pub trait Material {
-    fn scatter(
-        &self,
-        r_in: &Ray,
-        hitRecord: &HitRecord,
-        rng: &mut ThreadRng,
-    ) -> Option<(Ray, Vec3)>;
-}
-
-pub struct Lambertian {
-    pub albedo: Vec3,
-}
-
-impl Material for Lambertian {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
-        let scatter_direction = rec.normal + Ray::random_in_unit_sphere(rng);
-
-        let abs = scatter_direction.abs();
-        if (abs.x < 1e-8 && abs.y < 1e-8 && abs.z < 1e-8) {
-            return Some((
-                Ray {
-                    pos: rec.p,
-                    dir: rec.normal,
-                },
-                self.albedo,
-            ));
-        }
-
-        return Some((
-            Ray {
-                pos: rec.p,
-                dir: scatter_direction,
-            },
-            self.albedo,
-        ));
-    }
-}
-
-pub struct Metal {
-    pub albedo: Vec3,
-}
-
-impl Material for Metal {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
-        let v = r_in.dir.normalize();
-        let n = rec.normal;
-        let reflected = v - 2.0 * Vec3::dot(v, n) * n;
-
-        if (Vec3::dot(reflected, rec.normal) > 0.0) {
-            return Some((
-                Ray {
-                    pos: rec.p,
-                    dir: reflected,
-                },
-                self.albedo,
-            ));
-        }
-
-        return None;
     }
 }
