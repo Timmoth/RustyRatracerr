@@ -6,11 +6,11 @@ use rand::Rng;
 use std::rc::Rc;
 
 const ASPECT_RATIO: f32 = 16.0 / 9.0;
-const WIDTH: u32 = 1000;
+const WIDTH: u32 = 1200;
 const HEIGHT: u32 = (WIDTH as f32 / ASPECT_RATIO) as u32;
 
-const SAMPLES_PER_PIXEL: u32 = 200;
-const MAX_DEPTH: i32 = 100;
+const SAMPLES_PER_PIXEL: u32 = 600;
+const MAX_DEPTH: i32 = 60;
 
 fn main() {
     println!("Begin render {}x{}", WIDTH, HEIGHT);
@@ -18,46 +18,47 @@ fn main() {
     // Image
     let mut image_buffer = ImageBuffer::new(WIDTH, HEIGHT);
     // Camera
-    let camera: Camera = Camera::new(2.4, ASPECT_RATIO);
+    let look_from = Vec3::new(13.0, 2.0, 3.0);
+    let look_at = Vec3::new(0.0, 0.0, 0.0);
+    let camera: Camera = Camera::new(
+        look_from,
+        look_at,
+        Vec3::new(0.0, 1.0, 0.0),
+        0.35,
+        ASPECT_RATIO,
+        0.1,
+        10.0,
+    );
     let mut rng = rand::thread_rng();
 
     // World
     let mut hittable_list: HittableList = HittableList {
         objects: Vec::from([
             Box::new(Sphere::new(
-                Vec3::new(-1.0, 0.0, -1.0),
-                0.5,
+                Vec3::new(4.0, 1.0, 0.0),
+                1.0,
                 Rc::new(Metal {
-                    albedo: Vec3::new(0.5, 0.5, 0.5),
-                    fuzz: 0.3,
-                }) as Rc<_>,
-            )) as Box<_>,
-            Box::new(Sphere::new(
-                Vec3::new(0.0, 0.0, -2.0),
-                0.5,
-                Rc::new(Metal {
-                    albedo: Vec3::new(0.5, 0.5, 0.5),
-                    fuzz: 0.01,
-                }) as Rc<_>,
-            )) as Box<_>,
-            Box::new(Sphere::new(
-                Vec3::new(0.0, 0.0, -0.5),
-                0.5,
-                Rc::new(Dielectric {
-                    index_of_refraction: 1.1,
-                }) as Rc<_>,
-            )) as Box<_>,
-            Box::new(Sphere::new(
-                Vec3::new(1.0, 0.0, -1.0),
-                0.5,
-                Rc::new(Metal {
-                    albedo: Vec3::new(0.5, 0.5, 0.5),
+                    albedo: Vec3::new(0.8, 0.8, 0.8),
                     fuzz: 0.0,
                 }) as Rc<_>,
             )) as Box<_>,
             Box::new(Sphere::new(
-                Vec3::new(0.0, -100.5, -1.0),
-                100.0,
+                Vec3::new(0.0, 1.0, 0.0),
+                1.0,
+                Rc::new(Dielectric {
+                    index_of_refraction: 1.5,
+                }) as Rc<_>,
+            )) as Box<_>,
+            Box::new(Sphere::new(
+                Vec3::new(-4.0, 1.0, 0.0),
+                -1.0,
+                Rc::new(Dielectric {
+                    index_of_refraction: 1.5,
+                }) as Rc<_>,
+            )) as Box<_>,
+            Box::new(Sphere::new(
+                Vec3::new(0.0, -1000.0, -1.0),
+                1000.0,
                 Rc::new(Lambertian {
                     albedo: Vec3::new(0.5, 0.5, 0.5),
                 }) as Rc<_>,
@@ -65,22 +66,64 @@ fn main() {
         ]),
     };
 
-    // for n in 0..100 {
-    //     hittable_list.objects.insert(
-    //         0,
-    //         Box::new(Sphere {
-    //             center: Vec3::new(
-    //                 rng.gen_range(0.0..60.0) - 30.0,
-    //                 rng.gen_range(0.0..20.0),
-    //                 -rng.gen_range(0.0..30.0) + 5.0,
-    //             ),
-    //             radius: rng.gen_range(0.1..0.4),
-    //             material: Rc::new(Metal {
-    //                 albedo: Vec3::new(0.5, 0.5, 0.5),
-    //             }),
-    //         }) as Box<_>,
-    //     );
-    // }
+    for a in -11..11 {
+        for b in -11..11 {
+            let choose_mat = rng.gen_range(0.0..1.0);
+            let center = Vec3::new(
+                a as f32 + 0.9 * rng.gen_range(0.0..1.0),
+                0.2,
+                b as f32 + 0.9 * rng.gen_range(0.0..1.0),
+            );
+
+            if ((center - Vec3::new(4.0, 0.2, 0.0)).length() < 0.9) {
+                continue;
+            }
+
+            if (choose_mat < 0.7) {
+                hittable_list.objects.insert(
+                    0,
+                    Box::new(Sphere {
+                        center: center,
+                        radius: 0.2,
+                        material: Rc::new(Lambertian {
+                            albedo: Vec3::new(
+                                rng.gen_range(0.0..1.0),
+                                rng.gen_range(0.0..1.0),
+                                rng.gen_range(0.0..1.0),
+                            ),
+                        }),
+                    }) as Box<_>,
+                );
+            } else if (choose_mat < 0.9) {
+                hittable_list.objects.insert(
+                    0,
+                    Box::new(Sphere {
+                        center: center,
+                        radius: 0.2,
+                        material: Rc::new(Metal {
+                            fuzz: rng.gen_range(0.0..0.5),
+                            albedo: Vec3::new(
+                                rng.gen_range(0.5..1.0),
+                                rng.gen_range(0.5..1.0),
+                                rng.gen_range(0.5..1.0),
+                            ),
+                        }),
+                    }) as Box<_>,
+                );
+            } else {
+                hittable_list.objects.insert(
+                    0,
+                    Box::new(Sphere {
+                        center: center,
+                        radius: 0.2,
+                        material: Rc::new(Dielectric {
+                            index_of_refraction: 1.5,
+                        }),
+                    }) as Box<_>,
+                );
+            }
+        }
+    }
 
     let pixel_multiplier = Vec3::new(255.0, 255.0, 255.0);
     let samples = Vec3::new(
@@ -97,7 +140,7 @@ fn main() {
                 let u = (x as f32 + rng.gen_range(0.0..1.0)) / (WIDTH as f32 - 1.0);
                 let v = (y as f32 + rng.gen_range(0.0..1.0)) / (HEIGHT as f32 - 1.0);
 
-                let r = camera.get_ray(u, v);
+                let r = camera.get_ray(u, v, &mut rng);
                 pixel_color += r.color(&hittable_list, &mut rng, MAX_DEPTH);
             }
 
@@ -125,33 +168,66 @@ pub struct Camera {
     bottom_left: Vec3,
     horizontal: Vec3,
     vertical: Vec3,
+    lens_radius: f32,
+    u: Vec3,
+    v: Vec3,
+    w: Vec3,
 }
 
 impl Camera {
-    pub fn new(vertical_fov: f32, aspect_ratio: f32) -> Self {
-        let viewport_height = (vertical_fov / 2.0).tan();
+    pub fn new(
+        look_from: Vec3,
+        look_at: Vec3,
+        v_up: Vec3,
+        vertical_fov: f32,
+        aspect_ratio: f32,
+        aperture: f32,
+        focus_dist: f32,
+    ) -> Self {
+        let h = (vertical_fov / 2.0).tan();
+        let viewport_height = 2.0 * h;
         let viewport_width = aspect_ratio * viewport_height;
-        let focal_length = 1.0;
 
-        let origin = Vec3::new(0.0, 0.0, 0.0);
-        let horizontal = Vec3::new(viewport_width, 0.0, 0.0);
-        let vertical = Vec3::new(0.0, viewport_height, 0.0);
-        let bottom_left =
-            origin - horizontal / 2.0 - vertical / 2.0 - Vec3::new(0.0, 0.0, focal_length);
+        let w = (look_from - look_at).normalize();
+        let u = Vec3::cross(v_up, w).normalize();
+        let v = Vec3::cross(w, u);
+
+        let horizontal = focus_dist * viewport_width * u;
+        let vertical = focus_dist * viewport_height * v;
+
+        let bottom_left = look_from - horizontal / 2.0 - vertical / 2.0 - focus_dist * w;
 
         Camera {
-            origin,
-            horizontal,
-            vertical,
+            origin: look_from,
+            horizontal: focus_dist * viewport_width * u,
+            vertical: focus_dist * viewport_height * v,
             bottom_left,
+            lens_radius: aperture / 2.0,
+            u,
+            v,
+            w,
         }
     }
 
-    pub fn get_ray(&self, u: f32, v: f32) -> Ray {
+    pub fn get_ray(&self, s: f32, t: f32, rng: &mut ThreadRng) -> Ray {
+        let rd = self.lens_radius * Camera::random_in_unit_disk(rng);
+        let offset = self.u * rd.x + self.v * rd.y;
         return Ray {
-            pos: self.origin,
-            dir: self.bottom_left + u * self.horizontal + v * self.vertical - self.origin,
+            pos: self.origin + offset,
+            dir: self.bottom_left + s * self.horizontal + t * self.vertical - self.origin - offset,
         };
+    }
+
+    pub fn random_in_unit_disk(rng: &mut ThreadRng) -> Vec3 {
+        while true {
+            let p = Vec3::new(rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0);
+            if (p.length_squared() >= 1.0) {
+                continue;
+            }
+            return p;
+        }
+
+        return Vec3::new(0.0, 0.0, 0.0);
     }
 }
 
