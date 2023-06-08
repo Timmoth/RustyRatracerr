@@ -1,5 +1,6 @@
 # RustyRatracerr
-Experiments into HPC ray tracing using Rust
+Experiments into HPC ray tracing using Rust.
+📖Both Ray tracing & Rust are new to me so if you have any feedback I'd highly appriciate it!
 
 
 [Following along with this guide](https://raytracing.github.io/books/RayTracingInOneWeekend.html)
