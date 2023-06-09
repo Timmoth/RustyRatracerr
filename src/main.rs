@@ -1,139 +1,237 @@
 use glam::Vec3;
 use image::{ImageBuffer, Rgb};
 use rand::distributions::{Distribution, Uniform};
+use rand::prelude::*;
 use rand::rngs::ThreadRng;
 use rand::Rng;
+use rand_chacha::ChaCha8Rng;
+
 use std::rc::Rc;
 
-const ASPECT_RATIO: f32 = 16.0 / 9.0;
-const WIDTH: u32 = 1200;
-const HEIGHT: u32 = (WIDTH as f32 / ASPECT_RATIO) as u32;
+use mpi::topology::SystemCommunicator;
+use mpi::traits::*;
+use std::process;
+use std::thread::sleep;
+use std::time;
+use std::time::{Duration, SystemTime};
 
-const SAMPLES_PER_PIXEL: u32 = 600;
-const MAX_DEPTH: i32 = 60;
+const ASPECT_RATIO: f32 = 16.0 / 9.0;
+const WIDTH: usize = 1920;
+const HEIGHT: usize = (WIDTH as f32 / ASPECT_RATIO) as usize;
+
+const SAMPLES_PER_PIXEL: u32 = 3000;
+const MAX_DEPTH: i32 = 100;
 
 fn main() {
     println!("Begin render {}x{}", WIDTH, HEIGHT);
 
-    // Image
-    let mut image_buffer = ImageBuffer::new(WIDTH, HEIGHT);
-    // Camera
-    let look_from = Vec3::new(13.0, 2.0, 3.0);
-    let look_at = Vec3::new(0.0, 0.0, 0.0);
-    let camera: Camera = Camera::new(
-        look_from,
-        look_at,
-        Vec3::new(0.0, 1.0, 0.0),
-        0.35,
-        ASPECT_RATIO,
-        0.1,
-        10.0,
-    );
-    let mut rng = rand::thread_rng();
+    // Open MPI
+    let universe = mpi::initialize().unwrap();
+    let world = universe.world();
 
-    // World
-    let mut hittable_list: HittableList = HittableList {
-        objects: Vec::from([
-            Box::new(Sphere::new(
-                Vec3::new(4.0, 1.0, 0.0),
-                1.0,
-                Rc::new(Metal {
-                    albedo: Vec3::new(0.8, 0.8, 0.8),
-                    fuzz: 0.0,
-                }) as Rc<_>,
-            )) as Box<_>,
-            Box::new(Sphere::new(
-                Vec3::new(0.0, 1.0, 0.0),
-                1.0,
-                Rc::new(Dielectric {
-                    index_of_refraction: 1.5,
-                }) as Rc<_>,
-            )) as Box<_>,
-            Box::new(Sphere::new(
-                Vec3::new(-4.0, 1.0, 0.0),
-                -1.0,
-                Rc::new(Dielectric {
-                    index_of_refraction: 1.5,
-                }) as Rc<_>,
-            )) as Box<_>,
-            Box::new(Sphere::new(
-                Vec3::new(0.0, -1000.0, -1.0),
-                1000.0,
-                Rc::new(Lambertian {
-                    albedo: Vec3::new(0.5, 0.5, 0.5),
-                }) as Rc<_>,
-            )) as Box<_>,
-        ]),
-    };
+    if (world.rank() == 0) {
+        RunMaster(world, WIDTH, HEIGHT);
+    } else {
+        RunWorker(world, WIDTH, HEIGHT);
+    }
+}
 
-    for a in -11..11 {
-        for b in -11..11 {
-            let choose_mat = rng.gen_range(0.0..1.0);
-            let center = Vec3::new(
-                a as f32 + 0.9 * rng.gen_range(0.0..1.0),
-                0.2,
-                b as f32 + 0.9 * rng.gen_range(0.0..1.0),
-            );
+fn RunMaster(world: SystemCommunicator, width: usize, height: usize) {
+    println!("Starting");
+    let size = world.size() as usize;
+    let rank = world.rank() as usize;
+    let mut linesOut: i32 = 0;
+    let mut linesIn: i32 = 0;
 
-            if ((center - Vec3::new(4.0, 0.2, 0.0)).length() < 0.9) {
-                continue;
-            }
+    let mut imageBuffer = image::ImageBuffer::new(width as u32, height as u32);
+    let mut data: Vec<u32> = vec![0u32; width];
+    let timer = SystemTime::now();
 
-            if (choose_mat < 0.7) {
-                hittable_list.objects.insert(
-                    0,
-                    Box::new(Sphere {
-                        center: center,
-                        radius: 0.2,
-                        material: Rc::new(Lambertian {
-                            albedo: Vec3::new(
-                                rng.gen_range(0.0..1.0),
-                                rng.gen_range(0.0..1.0),
-                                rng.gen_range(0.0..1.0),
-                            ),
-                        }),
-                    }) as Box<_>,
-                );
-            } else if (choose_mat < 0.9) {
-                hittable_list.objects.insert(
-                    0,
-                    Box::new(Sphere {
-                        center: center,
-                        radius: 0.2,
-                        material: Rc::new(Metal {
-                            fuzz: rng.gen_range(0.0..0.5),
-                            albedo: Vec3::new(
-                                rng.gen_range(0.5..1.0),
-                                rng.gen_range(0.5..1.0),
-                                rng.gen_range(0.5..1.0),
-                            ),
-                        }),
-                    }) as Box<_>,
-                );
-            } else {
-                hittable_list.objects.insert(
-                    0,
-                    Box::new(Sphere {
-                        center: center,
-                        radius: 0.2,
-                        material: Rc::new(Dielectric {
-                            index_of_refraction: 1.5,
-                        }),
-                    }) as Box<_>,
-                );
+    loop {
+        let r = world.any_process().receive_into(&mut data);
+
+        if (r.tag() != 0) {
+            linesIn += 1;
+            println!("{} Finished line: {}", r.source_rank(), r.tag());
+            let y = r.tag() as u32;
+            for x in 0..width {
+                let pixel = imageBuffer.get_pixel_mut(x as u32, height as u32 - y);
+                let rgb = data[x];
+
+                let red = (rgb >> 16) & 255;
+                let green = rgb >> 8 & 255;
+                let blue = rgb & 255;
+
+                *pixel = image::Rgb([red as u8, green as u8, blue as u8]);
             }
         }
+
+        world.process_at_rank(r.source_rank()).send(&mut linesOut);
+        linesOut += 1;
+
+        if (linesIn >= (height - 1) as i32) {
+            // Save image to file
+            let file_name = format!("raytrace-{}x{}.png", width, height);
+            imageBuffer.save(file_name).unwrap();
+
+            // Status update
+            match timer.elapsed() {
+                Ok(elapsed) => {
+                    println!("Finished {}ms", elapsed.as_millis());
+                }
+                Err(e) => {
+                    println!("Error: {e:?}");
+                }
+            }
+
+            world.abort(0);
+            break;
+        }
     }
+}
 
-    let pixel_multiplier = Vec3::new(255.0, 255.0, 255.0);
-    let samples = Vec3::new(
-        SAMPLES_PER_PIXEL as f32,
-        SAMPLES_PER_PIXEL as f32,
-        SAMPLES_PER_PIXEL as f32,
-    );
+fn RunWorker(world: SystemCommunicator, width: usize, height: usize) {
+    let size = world.size() as usize;
+    let rank = world.rank() as usize;
+    let root_process = world.process_at_rank(0);
 
-    for y in 0..HEIGHT {
-        println!("Line {}:", y);
+    let mut lineIndex = 0;
+    // Used to store pixel values
+
+    let mut data: Vec<u32> = vec![0u32; width];
+
+    root_process.send_with_tag(&data, lineIndex);
+    root_process.receive_into(&mut lineIndex);
+
+    loop {
+        if (lineIndex >= height as i32) {
+            println!("Exit node {}", rank);
+            break;
+        }
+
+        let mut y = lineIndex;
+        println!("{} Working on line: {}", rank, y);
+
+        // Calculate each pixel
+        let timer = SystemTime::now();
+
+        // Camera
+        let look_from = Vec3::new(13.0, 2.0, 3.0);
+        let look_at = Vec3::new(0.0, 0.0, 0.0);
+        let camera: Camera = Camera::new(
+            look_from,
+            look_at,
+            Vec3::new(0.0, 1.0, 0.0),
+            0.35,
+            ASPECT_RATIO,
+            0.1,
+            10.0,
+        );
+        let mut rng = rand::thread_rng();
+
+        // World
+        let mut hittable_list: HittableList = HittableList {
+            objects: Vec::from([
+                Box::new(Sphere::new(
+                    Vec3::new(4.0, 1.0, 0.0),
+                    1.0,
+                    Rc::new(Metal {
+                        albedo: Vec3::new(0.8, 0.8, 0.8),
+                        fuzz: 0.0,
+                    }) as Rc<_>,
+                )) as Box<_>,
+                Box::new(Sphere::new(
+                    Vec3::new(0.0, 1.0, 0.0),
+                    1.0,
+                    Rc::new(Dielectric {
+                        index_of_refraction: 1.5,
+                    }) as Rc<_>,
+                )) as Box<_>,
+                Box::new(Sphere::new(
+                    Vec3::new(-4.0, 1.0, 0.0),
+                    -1.0,
+                    Rc::new(Dielectric {
+                        index_of_refraction: 1.5,
+                    }) as Rc<_>,
+                )) as Box<_>,
+                Box::new(Sphere::new(
+                    Vec3::new(0.0, -1000.0, -1.0),
+                    1000.0,
+                    Rc::new(Lambertian {
+                        albedo: Vec3::new(0.5, 0.5, 0.5),
+                    }) as Rc<_>,
+                )) as Box<_>,
+            ]),
+        };
+
+        let mut r = ChaCha8Rng::seed_from_u64(2);
+
+        for a in -11..11 {
+            for b in -11..11 {
+                let choose_mat = r.gen_range(0.0..1.0);
+                let center = Vec3::new(
+                    a as f32 + 0.9 * r.gen_range(0.0..1.0),
+                    0.2,
+                    b as f32 + 0.9 * r.gen_range(0.0..1.0),
+                );
+
+                if ((center - Vec3::new(4.0, 0.2, 0.0)).length() < 0.9) {
+                    continue;
+                }
+
+                if (choose_mat < 0.7) {
+                    hittable_list.objects.insert(
+                        0,
+                        Box::new(Sphere {
+                            center: center,
+                            radius: 0.2,
+                            material: Rc::new(Lambertian {
+                                albedo: Vec3::new(
+                                    r.gen_range(0.0..1.0),
+                                    r.gen_range(0.0..1.0),
+                                    r.gen_range(0.0..1.0),
+                                ),
+                            }),
+                        }) as Box<_>,
+                    );
+                } else if (choose_mat < 0.9) {
+                    hittable_list.objects.insert(
+                        0,
+                        Box::new(Sphere {
+                            center: center,
+                            radius: 0.2,
+                            material: Rc::new(Metal {
+                                fuzz: r.gen_range(0.0..0.5),
+                                albedo: Vec3::new(
+                                    r.gen_range(0.5..1.0),
+                                    r.gen_range(0.5..1.0),
+                                    r.gen_range(0.5..1.0),
+                                ),
+                            }),
+                        }) as Box<_>,
+                    );
+                } else {
+                    hittable_list.objects.insert(
+                        0,
+                        Box::new(Sphere {
+                            center: center,
+                            radius: 0.2,
+                            material: Rc::new(Dielectric {
+                                index_of_refraction: 1.5,
+                            }),
+                        }) as Box<_>,
+                    );
+                }
+            }
+        }
+
+        let pixel_multiplier = Vec3::new(255.0, 255.0, 255.0);
+        let samples = Vec3::new(
+            SAMPLES_PER_PIXEL as f32,
+            SAMPLES_PER_PIXEL as f32,
+            SAMPLES_PER_PIXEL as f32,
+        );
+
         for x in 0..WIDTH {
             let mut pixel_color = Vec3::new(0.0, 0.0, 0.0);
             for _ in 0..SAMPLES_PER_PIXEL {
@@ -146,21 +244,26 @@ fn main() {
 
             pixel_color /= samples;
 
-            image_buffer.put_pixel(
-                x,
-                (HEIGHT - 1) - y,
-                Rgb([
-                    (pixel_color.x.sqrt() * 256.0) as u8,
-                    (pixel_color.y.sqrt() * 256.0) as u8,
-                    (pixel_color.z.sqrt() * 256.0) as u8,
-                ]),
-            );
+            let r = (pixel_color.x.sqrt() * 255.0) as u32;
+            let g = (pixel_color.y.sqrt() * 255.0) as u32;
+            let b = (pixel_color.z.sqrt() * 255.0) as u32;
+            // Store the color value based on the escape time
+            data[x] = r << 16 | g << 8 | b
         }
-    }
 
-    // Save image to file
-    let file_name = format!("./images/raytrace-{}x{}.png", WIDTH, HEIGHT);
-    image_buffer.save(file_name).unwrap();
+        // Status update
+        match timer.elapsed() {
+            Ok(elapsed) => {
+                println!("Rank{} {}/{} {}ms", rank, y, height, elapsed.as_millis());
+            }
+            Err(e) => {
+                println!("Error: {e:?}");
+            }
+        }
+
+        root_process.send_with_tag(&data, y);
+        root_process.receive_into(&mut lineIndex);
+    }
 }
 
 pub struct Camera {
