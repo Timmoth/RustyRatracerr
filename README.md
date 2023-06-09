@@ -6,8 +6,13 @@
 👨‍🏫[Ray Tracing In One Weekend](https://raytracing.github.io/books/RayTracingInOneWeekend.html)
 
 🏃‍♀️
+
+[Follow this guide to get slurm & openMpi setup on your cluster](https://glmdev.medium.com/building-a-raspberry-pi-cluster-784f0df9afbd)
+
 ```bash
-cargo run --release
+cargo build --release
+sbatch ./run.sh
+squeue
 ```
 
 <p align="center">
