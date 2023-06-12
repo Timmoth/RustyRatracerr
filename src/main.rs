@@ -1,5 +1,4 @@
 use glam::Vec3;
-use image::{ImageBuffer, Rgb};
 use rand::distributions::{Distribution, Uniform};
 use rand::prelude::*;
 use rand::rngs::ThreadRng;
@@ -10,17 +9,14 @@ use std::rc::Rc;
 
 use mpi::topology::SystemCommunicator;
 use mpi::traits::*;
-use std::process;
-use std::thread::sleep;
-use std::time;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 const ASPECT_RATIO: f32 = 16.0 / 9.0;
-const WIDTH: usize = 1920;
+const WIDTH: usize = 720;
 const HEIGHT: usize = (WIDTH as f32 / ASPECT_RATIO) as usize;
 
-const SAMPLES_PER_PIXEL: u32 = 3000;
-const MAX_DEPTH: i32 = 100;
+const SAMPLES_PER_PIXEL: u32 = 100;
+const MAX_DEPTH: i32 = 60;
 
 fn main() {
     println!("Begin render {}x{}", WIDTH, HEIGHT);
@@ -29,17 +25,15 @@ fn main() {
     let universe = mpi::initialize().unwrap();
     let world = universe.world();
 
-    if (world.rank() == 0) {
-        RunMaster(world, WIDTH, HEIGHT);
+    if world.rank() == 0 {
+        run_master(world, WIDTH, HEIGHT);
     } else {
-        RunWorker(world, WIDTH, HEIGHT);
+        run_worker(world, WIDTH, HEIGHT);
     }
 }
 
-fn RunMaster(world: SystemCommunicator, width: usize, height: usize) {
+fn run_master(world: SystemCommunicator, width: usize, height: usize) {
     println!("Starting");
-    let size = world.size() as usize;
-    let rank = world.rank() as usize;
     let mut linesOut: i32 = 0;
     let mut linesIn: i32 = 0;
 
@@ -50,7 +44,7 @@ fn RunMaster(world: SystemCommunicator, width: usize, height: usize) {
     loop {
         let r = world.any_process().receive_into(&mut data);
 
-        if (r.tag() != 0) {
+        if r.tag() != 0 {
             linesIn += 1;
             println!("{} Finished line: {}", r.source_rank(), r.tag());
             let y = r.tag() as u32;
@@ -69,7 +63,7 @@ fn RunMaster(world: SystemCommunicator, width: usize, height: usize) {
         world.process_at_rank(r.source_rank()).send(&mut linesOut);
         linesOut += 1;
 
-        if (linesIn >= (height - 1) as i32) {
+        if linesIn >= (height - 1) as i32 {
             // Save image to file
             let file_name = format!("raytrace-{}x{}.png", width, height);
             imageBuffer.save(file_name).unwrap();
@@ -85,13 +79,11 @@ fn RunMaster(world: SystemCommunicator, width: usize, height: usize) {
             }
 
             world.abort(0);
-            break;
         }
     }
 }
 
-fn RunWorker(world: SystemCommunicator, width: usize, height: usize) {
-    let size = world.size() as usize;
+fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
     let rank = world.rank() as usize;
     let root_process = world.process_at_rank(0);
 
@@ -104,12 +96,12 @@ fn RunWorker(world: SystemCommunicator, width: usize, height: usize) {
     root_process.receive_into(&mut lineIndex);
 
     loop {
-        if (lineIndex >= height as i32) {
+        if lineIndex >= height as i32 {
             println!("Exit node {}", rank);
             break;
         }
 
-        let mut y = lineIndex;
+        let y = lineIndex;
         println!("{} Working on line: {}", rank, y);
 
         // Calculate each pixel
@@ -175,11 +167,11 @@ fn RunWorker(world: SystemCommunicator, width: usize, height: usize) {
                     b as f32 + 0.9 * r.gen_range(0.0..1.0),
                 );
 
-                if ((center - Vec3::new(4.0, 0.2, 0.0)).length() < 0.9) {
+                if (center - Vec3::new(4.0, 0.2, 0.0)).length() < 0.9 {
                     continue;
                 }
 
-                if (choose_mat < 0.7) {
+                if choose_mat < 0.7 {
                     hittable_list.objects.insert(
                         0,
                         Box::new(Sphere {
@@ -194,7 +186,7 @@ fn RunWorker(world: SystemCommunicator, width: usize, height: usize) {
                             }),
                         }) as Box<_>,
                     );
-                } else if (choose_mat < 0.9) {
+                } else if choose_mat < 0.9 {
                     hittable_list.objects.insert(
                         0,
                         Box::new(Sphere {
@@ -225,7 +217,6 @@ fn RunWorker(world: SystemCommunicator, width: usize, height: usize) {
             }
         }
 
-        let pixel_multiplier = Vec3::new(255.0, 255.0, 255.0);
         let samples = Vec3::new(
             SAMPLES_PER_PIXEL as f32,
             SAMPLES_PER_PIXEL as f32,
@@ -274,7 +265,6 @@ pub struct Camera {
     lens_radius: f32,
     u: Vec3,
     v: Vec3,
-    w: Vec3,
 }
 
 impl Camera {
@@ -308,7 +298,6 @@ impl Camera {
             lens_radius: aperture / 2.0,
             u,
             v,
-            w,
         }
     }
 
@@ -322,15 +311,13 @@ impl Camera {
     }
 
     pub fn random_in_unit_disk(rng: &mut ThreadRng) -> Vec3 {
-        while true {
+        loop {
             let p = Vec3::new(rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0);
-            if (p.length_squared() >= 1.0) {
+            if p.length_squared() >= 1.0 {
                 continue;
             }
             return p;
         }
-
-        return Vec3::new(0.0, 0.0, 0.0);
     }
 }
 
@@ -463,7 +450,7 @@ impl Ray {
             let rec = hit.unwrap();
             let cc = rec.material.scatter(self, &rec, rng);
 
-            if (cc.is_some()) {
+            if cc.is_some() {
                 let ccc = cc.unwrap();
                 return ccc.1 * ccc.0.color(hittable, rng, depth - 1);
             }
@@ -494,20 +481,17 @@ impl Ray {
 
     pub fn random_in_unit_sphere(rng: &mut ThreadRng) -> Vec3 {
         let die = Uniform::from(-1.0..1.0);
-
-        while true {
+        loop {
             let p = Vec3::new(die.sample(rng), die.sample(rng), die.sample(rng));
 
             if p.length_squared() < 1.0 {
                 return p;
             }
         }
-
-        return Vec3::new(0.0, 0.0, 0.0);
     }
 
     pub fn random_in_hemisphere(p: Vec3, normal: Vec3) -> Vec3 {
-        if (Vec3::dot(p, normal) > 0.0) {
+        if Vec3::dot(p, normal) > 0.0 {
             return p;
         }
 
@@ -519,7 +503,7 @@ pub trait Material {
     fn scatter(
         &self,
         r_in: &Ray,
-        hitRecord: &HitRecord,
+        hit_record: &HitRecord,
         rng: &mut ThreadRng,
     ) -> Option<(Ray, Vec3)>;
 }
@@ -533,7 +517,7 @@ impl Material for Lambertian {
         let scatter_direction = rec.normal + Ray::random_in_unit_sphere(rng);
 
         let abs = scatter_direction.abs();
-        if (abs.x < 1e-8 && abs.y < 1e-8 && abs.z < 1e-8) {
+        if abs.x < 1e-8 && abs.y < 1e-8 && abs.z < 1e-8 {
             return Some((
                 Ray {
                     pos: rec.p,
@@ -564,7 +548,7 @@ impl Material for Metal {
         let n = rec.normal;
         let reflected = v - 2.0 * Vec3::dot(v, n) * n;
 
-        if (Vec3::dot(reflected, rec.normal) > 0.0) {
+        if Vec3::dot(reflected, rec.normal) > 0.0 {
             return Some((
                 Ray::new(
                     rec.p,
@@ -583,21 +567,21 @@ pub struct Dielectric {
 }
 
 impl Material for Dielectric {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
+    fn scatter(&self, ray: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
         let refraction_ratio = if rec.front_face {
-            (1.0 / self.index_of_refraction)
+            1.0 / self.index_of_refraction
         } else {
             self.index_of_refraction
         };
 
-        let unit_direction = r_in.dir.normalize();
+        let unit_direction = ray.dir.normalize();
 
         let cos_theta = Vec3::dot(-unit_direction, rec.normal).min(1.0);
         let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
 
         let cannot_refract = refraction_ratio * sin_theta > 1.0;
-        let direction = if (cannot_refract
-            || Dielectric::reflectance(cos_theta, refraction_ratio) > rng.gen_range(0.0..1.0))
+        let direction = if cannot_refract
+            || Dielectric::reflectance(cos_theta, refraction_ratio) > rng.gen_range(0.0..1.0)
         {
             Dielectric::reflect(unit_direction, rec.normal)
         } else {
