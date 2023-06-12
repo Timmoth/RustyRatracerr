@@ -1,27 +1,31 @@
 use glam::Vec3;
-use rand::distributions::{Distribution, Uniform};
 use rand::prelude::*;
-use rand::rngs::ThreadRng;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
 use std::rc::Rc;
+
+use crate::renderer::camera::Camera;
+use crate::renderer::dielectric::Dielectric;
+use crate::renderer::hittable_list::HittableList;
+use crate::renderer::lambertian::Lambertian;
+use crate::renderer::metal::Metal;
+use crate::renderer::sphere::Sphere;
 
 use mpi::topology::SystemCommunicator;
 use mpi::traits::*;
 use std::time::SystemTime;
 
 const ASPECT_RATIO: f32 = 16.0 / 9.0;
-const WIDTH: usize = 720;
+const WIDTH: usize = 500;
 const HEIGHT: usize = (WIDTH as f32 / ASPECT_RATIO) as usize;
 
 const SAMPLES_PER_PIXEL: u32 = 100;
 const MAX_DEPTH: i32 = 60;
+mod renderer;
 
 fn main() {
-    println!("Begin render {}x{}", WIDTH, HEIGHT);
-
-    // Open MPI
+    // Initialize Open MPI
     let universe = mpi::initialize().unwrap();
     let world = universe.world();
 
@@ -33,42 +37,51 @@ fn main() {
 }
 
 fn run_master(world: SystemCommunicator, width: usize, height: usize) {
-    println!("Starting");
-    let mut linesOut: i32 = 0;
-    let mut linesIn: i32 = 0;
+    println!("Begin render {}x{}", width, height);
 
-    let mut imageBuffer = image::ImageBuffer::new(width as u32, height as u32);
-    let mut data: Vec<u32> = vec![0u32; width];
+    let mut rows_dispatched: i32 = 0; // The number of rows that have been dispatched to workers
+    let mut rows_completed: i32 = 0; // The number of rows that have been completed by workers
+
+    // Used to save the rendered image
+    let mut output_image_buffer = image::ImageBuffer::new(width as u32, height as u32);
+    // Stores row pixel data produced by each worker.
+    let mut worker_row_buffer: Vec<u32> = vec![0u32; width];
+    // Used to time how long the render takes
     let timer = SystemTime::now();
 
     loop {
-        let r = world.any_process().receive_into(&mut data);
+        // Wait for the next worker to produce a new row
+        let status = world.any_process().receive_into(&mut worker_row_buffer);
+        let worker_index = status.source_rank();
+        let row_index = status.tag() as u32;
 
-        if r.tag() != 0 {
-            linesIn += 1;
-            println!("{} Finished line: {}", r.source_rank(), r.tag());
-            let y = r.tag() as u32;
+        if row_index != 0 {
+            rows_completed += 1;
             for x in 0..width {
-                let pixel = imageBuffer.get_pixel_mut(x as u32, height as u32 - y);
-                let rgb = data[x];
-
+                // Get the pixel data from the worker row buffer
+                let rgb = worker_row_buffer[x];
                 let red = (rgb >> 16) & 255;
                 let green = rgb >> 8 & 255;
                 let blue = rgb & 255;
 
+                // Store the pixel data in the output image buffer
+                let pixel = output_image_buffer.get_pixel_mut(x as u32, height as u32 - row_index);
                 *pixel = image::Rgb([red as u8, green as u8, blue as u8]);
             }
         }
 
-        world.process_at_rank(r.source_rank()).send(&mut linesOut);
-        linesOut += 1;
+        // Send the worker a new row to render
+        world
+            .process_at_rank(worker_index)
+            .send(&mut rows_dispatched);
+        rows_dispatched += 1;
 
-        if linesIn >= (height - 1) as i32 {
+        if rows_completed >= (height - 1) as i32 {
             // Save image to file
-            let file_name = format!("raytrace-{}x{}.png", width, height);
-            imageBuffer.save(file_name).unwrap();
+            let file_name = format!("raytrace-{}x{}_{}.png", width, height, SAMPLES_PER_PIXEL);
+            output_image_buffer.save(file_name).unwrap();
 
-            // Status update
+            // Output how long the render took
             match timer.elapsed() {
                 Ok(elapsed) => {
                     println!("Finished {}ms", elapsed.as_millis());
@@ -78,33 +91,35 @@ fn run_master(world: SystemCommunicator, width: usize, height: usize) {
                 }
             }
 
+            // Exit the program
             world.abort(0);
         }
     }
 }
 
 fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
-    let rank = world.rank() as usize;
+    let worker_index = world.rank() as usize;
     let root_process = world.process_at_rank(0);
 
-    let mut lineIndex = 0;
-    // Used to store pixel values
+    // The index of the current row being processed by the worker
+    let mut row_index = 0;
 
-    let mut data: Vec<u32> = vec![0u32; width];
+    // Used to store pixel values being rendered for the current row
+    let mut row_image_buffer: Vec<u32> = vec![0u32; width];
 
-    root_process.send_with_tag(&data, lineIndex);
-    root_process.receive_into(&mut lineIndex);
+    // Initially send an empty buffer to the root process to let it know that the worker has started
+    root_process.send_with_tag(&row_image_buffer, row_index);
+    // Wait for the root process to send a row index to be rendered
+    root_process.receive_into(&mut row_index);
 
     loop {
-        if lineIndex >= height as i32 {
-            println!("Exit node {}", rank);
+        if row_index >= height as i32 {
+            // If the worker sends an index that is larger than the height of the image, the program has finished
+            println!("Exit node {}", worker_index);
             break;
         }
 
-        let y = lineIndex;
-        println!("{} Working on line: {}", rank, y);
-
-        // Calculate each pixel
+        // Used to time how long this row took to render
         let timer = SystemTime::now();
 
         // Camera
@@ -119,6 +134,7 @@ fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
             0.1,
             10.0,
         );
+
         let mut rng = rand::thread_rng();
 
         // World
@@ -156,15 +172,15 @@ fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
             ]),
         };
 
-        let mut r = ChaCha8Rng::seed_from_u64(2);
+        let mut scene_rng = ChaCha8Rng::seed_from_u64(2);
 
         for a in -11..11 {
             for b in -11..11 {
-                let choose_mat = r.gen_range(0.0..1.0);
+                let choose_mat = scene_rng.gen_range(0.0..1.0);
                 let center = Vec3::new(
-                    a as f32 + 0.9 * r.gen_range(0.0..1.0),
+                    a as f32 + 0.9 * scene_rng.gen_range(0.0..1.0),
                     0.2,
-                    b as f32 + 0.9 * r.gen_range(0.0..1.0),
+                    b as f32 + 0.9 * scene_rng.gen_range(0.0..1.0),
                 );
 
                 if (center - Vec3::new(4.0, 0.2, 0.0)).length() < 0.9 {
@@ -179,9 +195,9 @@ fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
                             radius: 0.2,
                             material: Rc::new(Lambertian {
                                 albedo: Vec3::new(
-                                    r.gen_range(0.0..1.0),
-                                    r.gen_range(0.0..1.0),
-                                    r.gen_range(0.0..1.0),
+                                    scene_rng.gen_range(0.0..1.0),
+                                    scene_rng.gen_range(0.0..1.0),
+                                    scene_rng.gen_range(0.0..1.0),
                                 ),
                             }),
                         }) as Box<_>,
@@ -193,11 +209,11 @@ fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
                             center: center,
                             radius: 0.2,
                             material: Rc::new(Metal {
-                                fuzz: r.gen_range(0.0..0.5),
+                                fuzz: scene_rng.gen_range(0.0..0.5),
                                 albedo: Vec3::new(
-                                    r.gen_range(0.5..1.0),
-                                    r.gen_range(0.5..1.0),
-                                    r.gen_range(0.5..1.0),
+                                    scene_rng.gen_range(0.5..1.0),
+                                    scene_rng.gen_range(0.5..1.0),
+                                    scene_rng.gen_range(0.5..1.0),
                                 ),
                             }),
                         }) as Box<_>,
@@ -227,7 +243,7 @@ fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
             let mut pixel_color = Vec3::new(0.0, 0.0, 0.0);
             for _ in 0..SAMPLES_PER_PIXEL {
                 let u = (x as f32 + rng.gen_range(0.0..1.0)) / (WIDTH as f32 - 1.0);
-                let v = (y as f32 + rng.gen_range(0.0..1.0)) / (HEIGHT as f32 - 1.0);
+                let v = (row_index as f32 + rng.gen_range(0.0..1.0)) / (HEIGHT as f32 - 1.0);
 
                 let r = camera.get_ray(u, v, &mut rng);
                 pixel_color += r.color(&hittable_list, &mut rng, MAX_DEPTH);
@@ -238,376 +254,29 @@ fn run_worker(world: SystemCommunicator, width: usize, height: usize) {
             let r = (pixel_color.x.sqrt() * 255.0) as u32;
             let g = (pixel_color.y.sqrt() * 255.0) as u32;
             let b = (pixel_color.z.sqrt() * 255.0) as u32;
-            // Store the color value based on the escape time
-            data[x] = r << 16 | g << 8 | b
+
+            row_image_buffer[x] = r << 16 | g << 8 | b
         }
 
         // Status update
         match timer.elapsed() {
             Ok(elapsed) => {
-                println!("Rank{} {}/{} {}ms", rank, y, height, elapsed.as_millis());
+                println!(
+                    "worker {} completed row {}/{} in {}ms",
+                    worker_index,
+                    row_index,
+                    height,
+                    elapsed.as_millis()
+                );
             }
             Err(e) => {
                 println!("Error: {e:?}");
             }
         }
 
-        root_process.send_with_tag(&data, y);
-        root_process.receive_into(&mut lineIndex);
-    }
-}
-
-pub struct Camera {
-    origin: Vec3,
-    bottom_left: Vec3,
-    horizontal: Vec3,
-    vertical: Vec3,
-    lens_radius: f32,
-    u: Vec3,
-    v: Vec3,
-}
-
-impl Camera {
-    pub fn new(
-        look_from: Vec3,
-        look_at: Vec3,
-        v_up: Vec3,
-        vertical_fov: f32,
-        aspect_ratio: f32,
-        aperture: f32,
-        focus_dist: f32,
-    ) -> Self {
-        let h = (vertical_fov / 2.0).tan();
-        let viewport_height = 2.0 * h;
-        let viewport_width = aspect_ratio * viewport_height;
-
-        let w = (look_from - look_at).normalize();
-        let u = Vec3::cross(v_up, w).normalize();
-        let v = Vec3::cross(w, u);
-
-        let horizontal = focus_dist * viewport_width * u;
-        let vertical = focus_dist * viewport_height * v;
-
-        let bottom_left = look_from - horizontal / 2.0 - vertical / 2.0 - focus_dist * w;
-
-        Camera {
-            origin: look_from,
-            horizontal: focus_dist * viewport_width * u,
-            vertical: focus_dist * viewport_height * v,
-            bottom_left,
-            lens_radius: aperture / 2.0,
-            u,
-            v,
-        }
-    }
-
-    pub fn get_ray(&self, s: f32, t: f32, rng: &mut ThreadRng) -> Ray {
-        let rd = self.lens_radius * Camera::random_in_unit_disk(rng);
-        let offset = self.u * rd.x + self.v * rd.y;
-        return Ray {
-            pos: self.origin + offset,
-            dir: self.bottom_left + s * self.horizontal + t * self.vertical - self.origin - offset,
-        };
-    }
-
-    pub fn random_in_unit_disk(rng: &mut ThreadRng) -> Vec3 {
-        loop {
-            let p = Vec3::new(rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), 0.0);
-            if p.length_squared() >= 1.0 {
-                continue;
-            }
-            return p;
-        }
-    }
-}
-
-pub struct Ray {
-    pos: Vec3,
-    dir: Vec3,
-}
-
-pub struct HitRecord {
-    p: Vec3,
-    normal: Vec3,
-    t: f32,
-    front_face: bool,
-    material: Rc<dyn Material + 'static>,
-}
-
-impl HitRecord {
-    pub fn new(
-        r: &Ray,
-        normal: Vec3,
-        t: f32,
-        p: Vec3,
-
-        material: Rc<dyn Material + 'static>,
-    ) -> Self {
-        let front_face = Vec3::dot(r.dir, normal) < 0.0;
-        HitRecord {
-            t: t,
-            p: p,
-            normal: if front_face { normal } else { -normal },
-            front_face: front_face,
-            material: material,
-        }
-    }
-}
-
-pub trait Hittable {
-    fn hit(&self, r: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord>;
-}
-
-impl Sphere {
-    pub fn new(center: Vec3, radius: f32, material: Rc<dyn Material + 'static>) -> Self {
-        Sphere {
-            center: center,
-            radius: radius,
-            material: material,
-        }
-    }
-}
-
-pub struct Sphere {
-    center: Vec3,
-    radius: f32,
-    material: Rc<dyn Material + 'static>,
-}
-
-impl Hittable for Sphere {
-    fn hit(&self, r: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord> {
-        let oc = r.pos - self.center;
-        let a = r.dir.length_squared();
-
-        let half_b = Vec3::dot(oc, r.dir);
-        let c = oc.length_squared() - self.radius * self.radius;
-        let discriminant = half_b * half_b - a * c;
-
-        if discriminant < 0.0 {
-            return None;
-        }
-
-        let sqrtd = discriminant.sqrt();
-        let mut root = (-half_b - sqrtd) / a;
-        if root < t_min || t_max < root {
-            root = (-half_b + sqrtd) / a;
-            if root < t_min || t_max < root {
-                return None;
-            }
-        }
-
-        let p = r.at(root);
-        return Some(HitRecord::new(
-            r,
-            (p - self.center) / self.radius,
-            root,
-            p,
-            self.material.clone(),
-        ));
-    }
-}
-
-pub struct HittableList {
-    pub objects: Vec<Box<dyn Hittable>>,
-}
-
-impl Hittable for HittableList {
-    fn hit(&self, r: &Ray, t_min: f32, t_max: f32) -> Option<HitRecord> {
-        let mut closest_hit: Option<HitRecord> = None;
-        let mut closest_so_far = t_max;
-        for hittable in self.objects.iter() {
-            let h = hittable.hit(r, t_min, t_max);
-            if h.is_some() {
-                let hh = h.unwrap();
-                if hh.t < closest_so_far {
-                    closest_so_far = hh.t;
-                    closest_hit = Some(hh);
-                }
-            }
-        }
-
-        return closest_hit;
-    }
-}
-
-impl Ray {
-    pub fn new(pos: Vec3, dir: Vec3) -> Self {
-        return Ray { pos: pos, dir: dir };
-    }
-
-    pub fn at(&self, t: f32) -> Vec3 {
-        return self.pos + t * self.dir;
-    }
-
-    pub fn color(&self, hittable: &impl Hittable, rng: &mut ThreadRng, depth: i32) -> Vec3 {
-        if depth <= 0 {
-            return Vec3::new(0.0, 0.0, 0.0);
-        }
-
-        let hit = hittable.hit(self, 0.001, std::f32::INFINITY);
-        if hit.is_some() {
-            // Draw collision surface normal
-            let rec = hit.unwrap();
-            let cc = rec.material.scatter(self, &rec, rng);
-
-            if cc.is_some() {
-                let ccc = cc.unwrap();
-                return ccc.1 * ccc.0.color(hittable, rng, depth - 1);
-            }
-
-            return Vec3::new(0.0, 0.0, 0.0);
-        }
-
-        // Background gradient
-        let unit_direction = self.dir.normalize();
-        let t = 0.5 * (unit_direction.y + 1.0);
-        return (1.0 - t) * Vec3::new(1.0, 1.0, 1.0) + t * Vec3::new(0.5, 0.7, 1.0);
-    }
-
-    pub fn hit_sphere(&self, center: Vec3, radius: f32) -> f32 {
-        let oc = self.pos - center;
-        let a = self.dir.length_squared();
-
-        let half_b = Vec3::dot(oc, self.dir);
-        let c = oc.length_squared() - radius * radius;
-        let discriminant = half_b * half_b - a * c;
-
-        if discriminant < 0.0 {
-            return -1.0;
-        } else {
-            return (-half_b - discriminant.sqrt()) / a;
-        }
-    }
-
-    pub fn random_in_unit_sphere(rng: &mut ThreadRng) -> Vec3 {
-        let die = Uniform::from(-1.0..1.0);
-        loop {
-            let p = Vec3::new(die.sample(rng), die.sample(rng), die.sample(rng));
-
-            if p.length_squared() < 1.0 {
-                return p;
-            }
-        }
-    }
-
-    pub fn random_in_hemisphere(p: Vec3, normal: Vec3) -> Vec3 {
-        if Vec3::dot(p, normal) > 0.0 {
-            return p;
-        }
-
-        return -p;
-    }
-}
-
-pub trait Material {
-    fn scatter(
-        &self,
-        r_in: &Ray,
-        hit_record: &HitRecord,
-        rng: &mut ThreadRng,
-    ) -> Option<(Ray, Vec3)>;
-}
-
-pub struct Lambertian {
-    pub albedo: Vec3,
-}
-
-impl Material for Lambertian {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
-        let scatter_direction = rec.normal + Ray::random_in_unit_sphere(rng);
-
-        let abs = scatter_direction.abs();
-        if abs.x < 1e-8 && abs.y < 1e-8 && abs.z < 1e-8 {
-            return Some((
-                Ray {
-                    pos: rec.p,
-                    dir: rec.normal,
-                },
-                self.albedo,
-            ));
-        }
-
-        return Some((
-            Ray {
-                pos: rec.p,
-                dir: scatter_direction,
-            },
-            self.albedo,
-        ));
-    }
-}
-
-pub struct Metal {
-    pub albedo: Vec3,
-    pub fuzz: f32,
-}
-
-impl Material for Metal {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
-        let v = r_in.dir.normalize();
-        let n = rec.normal;
-        let reflected = v - 2.0 * Vec3::dot(v, n) * n;
-
-        if Vec3::dot(reflected, rec.normal) > 0.0 {
-            return Some((
-                Ray::new(
-                    rec.p,
-                    reflected + self.fuzz * Ray::random_in_unit_sphere(rng),
-                ),
-                self.albedo,
-            ));
-        }
-
-        return None;
-    }
-}
-
-pub struct Dielectric {
-    pub index_of_refraction: f32,
-}
-
-impl Material for Dielectric {
-    fn scatter(&self, ray: &Ray, rec: &HitRecord, rng: &mut ThreadRng) -> Option<(Ray, Vec3)> {
-        let refraction_ratio = if rec.front_face {
-            1.0 / self.index_of_refraction
-        } else {
-            self.index_of_refraction
-        };
-
-        let unit_direction = ray.dir.normalize();
-
-        let cos_theta = Vec3::dot(-unit_direction, rec.normal).min(1.0);
-        let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
-
-        let cannot_refract = refraction_ratio * sin_theta > 1.0;
-        let direction = if cannot_refract
-            || Dielectric::reflectance(cos_theta, refraction_ratio) > rng.gen_range(0.0..1.0)
-        {
-            Dielectric::reflect(unit_direction, rec.normal)
-        } else {
-            Dielectric::refract(unit_direction, rec.normal, refraction_ratio)
-        };
-
-        return Some((Ray::new(rec.p, direction), Vec3::new(1.0, 1.0, 1.0)));
-    }
-}
-
-impl Dielectric {
-    pub fn refract(uv: Vec3, n: Vec3, etai_over_etat: f32) -> Vec3 {
-        let cos_theta = Vec3::dot(-uv, n).min(1.0);
-        let r_out_perp = etai_over_etat * (uv + cos_theta * n);
-        let r_out_parallel = (1.0 - r_out_perp.length_squared()).abs().sqrt() * -n;
-        return r_out_perp + r_out_parallel;
-    }
-
-    pub fn reflect(v: Vec3, n: Vec3) -> Vec3 {
-        return v - 2.0 * Vec3::dot(v, n) * n;
-    }
-
-    pub fn reflectance(cosine: f32, refraction_ratio: f32) -> f32 {
-        // Use Schlick's approximation for reflectance.
-        let mut r0 = (1.0 - refraction_ratio) / (1.0 + refraction_ratio);
-        r0 = r0 * r0;
-        return r0 + (1.0 - r0) * (1.0 - cosine).powf(5.0);
+        // Tell the root process to send a new row to render
+        root_process.send_with_tag(&row_image_buffer, row_index);
+        // Wait for the root process to send a row index to be rendered
+        root_process.receive_into(&mut row_index);
     }
 }
